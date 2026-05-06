@@ -1,0 +1,12 @@
+# editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# local test config (don't commit real coordinates)
+.env

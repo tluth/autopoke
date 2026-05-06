@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# autopoke — periodic mouse-mover and clicker for X11
+#
+# Setup:   autopoke install && autopoke configure
+# Run:     autopoke run [duration-in-seconds]
+
+set -uo pipefail
+
+PROG=$(basename "${BASH_SOURCE[0]}")
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autopoke"
+CONFIG_FILE="$CONFIG_DIR/config"
+INSTALL_DIR="$HOME/.local/bin"
+JITTER=3            # pixel randomisation radius on every move/click
+DEFAULT_INTERVAL=5  # seconds between click cycles when not set in config
+DEFAULT_DURATION=3600  # total run time in seconds when not set in config
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+require_cmd() {
+  command -v "$1" &>/dev/null \
+    || die "'$1' not found — run: $PROG install"
+}
+
+rand_float() {  # rand_float MIN MAX  →  random float in [MIN, MAX)
+  awk -v lo="$1" -v hi="$2" 'BEGIN{srand(); printf "%.2f", lo + rand()*(hi-lo)}'
+}
+
+rand_jitter() {  # →  random integer offset in [-JITTER, +JITTER]
+  echo $(( (RANDOM % (2*JITTER+1)) - JITTER ))
+}
+
+rand_interval() {
+  # Random duration centred on INTERVAL with ±20% spread (minimum spread: 0.5 s).
+  awk -v c="$INTERVAL" 'BEGIN{
+    srand()
+    spread = c * 0.2
+    if (spread < 0.5) spread = 0.5
+    lo = c - spread
+    if (lo < 0.1) lo = 0.1
+    printf "%.2f", lo + rand() * (2 * spread)
+  }'
+}
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+# Write all currently-set config variables to the config file.
+# Only writes keys whose variables are non-empty, so callers can source an
+# existing config first and then override individual keys before calling this.
+write_config() {
+  mkdir -p "$CONFIG_DIR"
+  local tmp
+  tmp=$(mktemp)
+  [[ -n "${TARGET_X:-}" ]] && printf 'TARGET_X=%d\n' "$TARGET_X" >> "$tmp"
+  [[ -n "${TARGET_Y:-}" ]] && printf 'TARGET_Y=%d\n' "$TARGET_Y" >> "$tmp"
+  [[ -n "${INTERVAL:-}" ]] && printf 'INTERVAL=%s\n' "$INTERVAL" >> "$tmp"
+  [[ -n "${DURATION:-}" ]] && printf 'DURATION=%d\n' "$DURATION" >> "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+# Load config and populate optional fields with defaults.
+# TARGET_X and TARGET_Y are required; INTERVAL and DURATION fall back to defaults.
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+  if [[ -z "${TARGET_X:-}" || -z "${TARGET_Y:-}" ]]; then
+    die "No target configured. Run: $PROG configure"
+  fi
+  INTERVAL=${INTERVAL:-$DEFAULT_INTERVAL}
+  DURATION=${DURATION:-$DEFAULT_DURATION}
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+  # --- Dependency check and installation ---
+  local missing=()
+  command -v xinput  &>/dev/null || missing+=(xinput)
+  command -v xdotool &>/dev/null || missing+=(xdotool)
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    printf 'Missing dependencies: %s\n\n' "${missing[*]}"
+
+    local pkg_cmd=()
+    if   command -v apt-get &>/dev/null; then pkg_cmd=(sudo apt-get install -y --no-install-recommends)
+    elif command -v dnf     &>/dev/null; then pkg_cmd=(sudo dnf install -y)
+    elif command -v pacman  &>/dev/null; then pkg_cmd=(sudo pacman -S --noconfirm)
+    elif command -v zypper  &>/dev/null; then pkg_cmd=(sudo zypper install -y)
+    else
+      die "No supported package manager found. Install manually: ${missing[*]}"
+    fi
+
+    printf 'Will run: %s %s\n' "${pkg_cmd[*]}" "${missing[*]}"
+    local reply
+    read -rp "Proceed? [Y/n] " reply
+    case "${reply,,}" in
+      n|no) die "Aborted. Install dependencies manually to continue." ;;
+    esac
+
+    "${pkg_cmd[@]}" "${missing[@]}" || die "Package installation failed."
+    printf '\n'
+  else
+    printf 'Dependencies already satisfied.\n'
+  fi
+
+  # --- Copy binary to install directory ---
+  local src
+  src=$(realpath "${BASH_SOURCE[0]}")
+
+  mkdir -p "$INSTALL_DIR"
+  install -m 755 "$src" "$INSTALL_DIR/$PROG"
+  printf 'Installed: %s/%s\n' "$INSTALL_DIR" "$PROG"
+
+  # --- PATH check ---
+  if ! printf '%s\n' "${PATH//:/$'\n'}" | grep -qx "$INSTALL_DIR"; then
+    printf '\nNote: %s is not in your PATH.\n' "$INSTALL_DIR"
+    printf 'Add this to ~/.bashrc (or ~/.profile) and reload your shell:\n\n'
+    printf '  export PATH="$HOME/.local/bin:$PATH"\n\n'
+    printf '  source ~/.bashrc\n'
+  fi
+
+  printf '\nNext: run "%s configure" to set your click target.\n' "$PROG"
+}
+
+cmd_uninstall() {
+  local installed="$INSTALL_DIR/$PROG"
+
+  if [[ ! -f "$installed" ]]; then
+    printf '%s is not installed at %s\n' "$PROG" "$INSTALL_DIR"
+  else
+    rm "$installed"
+    printf 'Removed %s\n' "$installed"
+  fi
+
+  if [[ -d "$CONFIG_DIR" ]]; then
+    local reply
+    read -rp "Also remove config directory ($CONFIG_DIR)? [y/N] " reply
+    case "${reply,,}" in
+      y|yes)
+        rm -rf "$CONFIG_DIR"
+        printf 'Removed %s\n' "$CONFIG_DIR"
+        ;;
+    esac
+  fi
+}
+
+cmd_configure() {
+  require_cmd xdotool
+
+  # Parse optional flags. When any flag is present the target wizard is skipped
+  # and only the specified settings are written. This lets the user update
+  # interval or duration independently without recapturing the target location.
+  local new_interval="" new_duration=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval|-i)
+        [[ "${2:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+          || die "--interval requires a positive number in seconds (got: '${2:-}')"
+        new_interval="$2"; shift 2 ;;
+      --duration|-d)
+        [[ "${2:-}" =~ ^[0-9]+$ ]] \
+          || die "--duration requires a positive integer in seconds (got: '${2:-}')"
+        new_duration="$2"; shift 2 ;;
+      *) die "Unknown option: $1. Valid options: --interval N, --duration N" ;;
+    esac
+  done
+
+  if [[ -n "$new_interval" || -n "$new_duration" ]]; then
+    # Settings-only mode: merge with existing config and save.
+    # shellcheck source=/dev/null
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" 2>/dev/null || true
+    [[ -n "$new_interval" ]] && INTERVAL="$new_interval"
+    [[ -n "$new_duration" ]] && DURATION="$new_duration"
+    write_config
+    [[ -n "$new_interval" ]] && printf 'Interval set to %s s (actual range: %.1f – %.1f s)\n' \
+      "$INTERVAL" "$(awk -v c="$INTERVAL" 'BEGIN{s=c*0.2; if(s<0.5)s=0.5; printf "%.1f",c-s}')" \
+      "$(awk -v c="$INTERVAL" 'BEGIN{s=c*0.2; if(s<0.5)s=0.5; printf "%.1f",c+s}')"
+    [[ -n "$new_duration" ]] && printf 'Duration set to %s s\n' "$DURATION"
+    printf 'Config: %s\n' "$CONFIG_FILE"
+    return
+  fi
+
+  # Interactive target wizard (no flags given).
+  # Preserve any existing INTERVAL/DURATION when saving the new target.
+  # shellcheck source=/dev/null
+  [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" 2>/dev/null || true
+
+  local use_click=false
+  command -v xinput &>/dev/null && use_click=true
+
+  while true; do
+    if $use_click; then
+      printf 'Move your mouse to the target location and click it.\n'
+      printf '(Ctrl+C to cancel)\n\n'
+
+      # xinput test-xi2 --root captures raw pointer events from the root window.
+      # If xinput exits immediately (e.g. under Wayland), grep gets EOF with no
+      # match and detected is empty — we fall back to Enter below.
+      # || true absorbs the SIGPIPE exit code when grep closes the pipe after matching.
+      local detected
+      detected=$(xinput test-xi2 --root 2>/dev/null | grep -m 1 "RawButtonPress" || true)
+
+      if [[ -z "$detected" ]]; then
+        use_click=false
+        printf 'Click detection unavailable on this system (Wayland?).\n'
+        printf 'Switching to Enter-based capture.\n\n'
+      fi
+    fi
+
+    if ! $use_click; then
+      printf 'Move your mouse to the target location, then press Enter.\n'
+      printf '(Ctrl+C to cancel)\n\n'
+      read -r
+    fi
+
+    # Capture position — cursor should still be over the target.
+    local pos x y
+    pos=$(xdotool getmouselocation --shell)
+    x=$(printf '%s\n' "$pos" | awk -F= '/^X=/{print int($2)}')
+    y=$(printf '%s\n' "$pos" | awk -F= '/^Y=/{print int($2)}')
+
+    printf '\nCaptured: x=%s, y=%s\n' "$x" "$y"
+
+    local reply
+    read -rp "Save as click target? [Y/n] " reply
+    case "${reply,,}" in
+      n|no)
+        printf '\nOK, try again.\n\n'
+        ;;
+      *)
+        TARGET_X="$x"
+        TARGET_Y="$y"
+        write_config
+        printf 'Saved to %s\n' "$CONFIG_FILE"
+        printf 'Run "%s run" to start.\n' "$PROG"
+        return
+        ;;
+    esac
+  done
+}
+
+cmd_run() {
+  local cli_duration=""
+  if [[ $# -gt 0 ]]; then
+    [[ "$1" =~ ^[0-9]+$ ]] \
+      || die "Duration must be a whole number of seconds (got: $1)."
+    cli_duration="$1"
+  fi
+
+  require_cmd xdotool
+  load_config
+
+  # Command-line duration overrides the config value.
+  [[ -n "$cli_duration" ]] && DURATION="$cli_duration"
+
+  local end_time
+  end_time=$(( $(date +%s) + DURATION ))
+
+  printf 'Running for %ds — target x=%d y=%d, interval ~%ss (±20%%). Ctrl+C to stop.\n' \
+    "$DURATION" "$TARGET_X" "$TARGET_Y" "$INTERVAL"
+
+  while [[ "$(date +%s)" -lt "$end_time" ]]; do
+    if [[ "$(date +%s)" -ge "$end_time" ]]; then exit 0; fi
+
+    local x y
+    x=$(( TARGET_X + $(rand_jitter) ))
+    y=$(( TARGET_Y + $(rand_jitter) ))
+
+    xdotool mousemove "$x" "$y"
+    xdotool click 1
+    sleep "$(rand_float 0.3 0.7)"
+    xdotool click 1
+
+    sleep "$(rand_interval)"
+  done
+
+  printf 'Done.\n'
+}
+
+cmd_help() {
+  cat <<EOF
+Usage: $PROG <command> [args]
+
+Commands:
+  install                        Install dependencies and copy binary to ~/.local/bin
+  uninstall                      Remove the installed binary (and optionally config)
+  configure                      Interactively set the click target location
+  configure --interval <secs>    Save the interval between click cycles (decimals ok)
+  configure --duration <secs>    Save the default run duration
+  run [seconds]                  Click in a loop using saved settings (default: ${DEFAULT_DURATION}s)
+  help                           Show this help
+
+Flags for configure can be combined:
+  $PROG configure --interval 10 --duration 1800
+
+The interval is randomised ±20% on each cycle (minimum spread: 0.5 s).
+
+Examples:
+  $PROG install                  # install dependencies and binary
+  $PROG configure                # set click target (interactive)
+  $PROG configure --interval 10  # click every ~10 s
+  $PROG configure --duration 900 # default run time of 15 min
+  $PROG run                      # run with saved settings
+  $PROG run 300                  # run for 5 min, override duration only
+  $PROG 300                      # shorthand for the above
+
+Config: $CONFIG_FILE
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd=${1:-run}
+  shift || true
+  case "$cmd" in
+    install)                 cmd_install ;;
+    uninstall)               cmd_uninstall ;;
+    configure|config|setup)  cmd_configure "$@" ;;
+    run)                     cmd_run "$@" ;;
+    help|-h|--help)          cmd_help ;;
+    *[0-9]*)                 cmd_run "$cmd" ;;
+    *)
+      printf 'Unknown command: %s\n\n' "$cmd" >&2
+      cmd_help >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
