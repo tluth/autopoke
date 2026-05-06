@@ -6,16 +6,14 @@ Configure a screen coordinate once; autopoke moves the cursor there and clicks a
 
 ## How it works
 
-Each cycle, autopoke:
+Each click cycle, autopoke:
 
-1. Applies a small random pixel offset to the configured target coordinate
-2. Moves the mouse there
-3. Waits a random interval (3–4 s)
-4. Clicks
-5. Waits again (0.5–2 s) and clicks a second time
-6. Repeats steps 1–5 a second time with a fresh random offset
+1. Moves the mouse to the configured target with a small random pixel offset
+2. Clicks
+3. Waits for a randomised interval (±20% of the configured value, 5 s default)
+4. Repeats from step 1
 
-The randomised movement and timing produce a more natural interaction pattern than a fixed mechanical click.
+The randomised position and interval produce a more natural interaction pattern than a fixed, mechanical click.
 
 Configuration is stored in `~/.config/autopoke/config` ([XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) compliant).
 

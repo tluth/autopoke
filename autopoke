@@ -124,6 +124,7 @@ cmd_install() {
   if ! printf '%s\n' "${PATH//:/$'\n'}" | grep -qx "$INSTALL_DIR"; then
     printf '\nNote: %s is not in your PATH.\n' "$INSTALL_DIR"
     printf 'Add this to ~/.bashrc (or ~/.profile) and reload your shell:\n\n'
+    # shellcheck disable=SC2016  # literal $HOME is intentional — this is user-facing copy-paste text
     printf '  export PATH="$HOME/.local/bin:$PATH"\n\n'
     printf '  source ~/.bashrc\n'
   fi
@@ -176,8 +177,10 @@ cmd_configure() {
 
   if [[ -n "$new_interval" || -n "$new_duration" ]]; then
     # Settings-only mode: merge with existing config and save.
-    # shellcheck source=/dev/null
-    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" 2>/dev/null || true
+    if [[ -f "$CONFIG_FILE" ]]; then
+      # shellcheck source=/dev/null
+      source "$CONFIG_FILE" 2>/dev/null || true
+    fi
     [[ -n "$new_interval" ]] && INTERVAL="$new_interval"
     [[ -n "$new_duration" ]] && DURATION="$new_duration"
     write_config
@@ -191,8 +194,10 @@ cmd_configure() {
 
   # Interactive target wizard (no flags given).
   # Preserve any existing INTERVAL/DURATION when saving the new target.
-  # shellcheck source=/dev/null
-  [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" 2>/dev/null || true
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE" 2>/dev/null || true
+  fi
 
   local use_click=false
   command -v xinput &>/dev/null && use_click=true
@@ -276,8 +281,6 @@ cmd_run() {
     y=$(( TARGET_Y + $(rand_jitter) ))
 
     xdotool mousemove "$x" "$y"
-    xdotool click 1
-    sleep "$(rand_float 0.3 0.7)"
     xdotool click 1
 
     sleep "$(rand_interval)"
